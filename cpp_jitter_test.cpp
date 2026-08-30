@@ -1,8 +1,13 @@
-#include <iostream>
-#include <fstream>
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
-#include <atomic>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <sstream>
+#include <thread>
+
 #include "portaudio.h"
 
 // Benchmark Constraints & Constants
@@ -14,6 +19,7 @@ constexpr double DEADLINE_MS = (static_cast<double>(BLOCK_SIZE) / SAMPLE_RATE) *
 constexpr double DEADLINE_US = DEADLINE_MS * 1000.0;                                     // ~2902.49 us
 constexpr double RUN_DURATION_SEC = 10.0;
 constexpr size_t MAX_RECORDS = 10000; // Pre-allocated storage for ~3,445 callbacks
+constexpr size_t LIVE_HISTORY = 32;
 
 struct CallbackMetric {
     double timestamp_sec;
@@ -24,11 +30,17 @@ struct CallbackMetric {
 
 // Global Pre-allocated Storage (Strict Zero-Allocation in Real-Time Path)
 static CallbackMetric g_metrics[MAX_RECORDS];
-static size_t g_metric_count = 0;
+static std::atomic<size_t> g_metric_count{0};
 using clock_type = std::chrono::high_resolution_clock;
 static std::chrono::time_point<clock_type> g_benchmark_start;
 static std::chrono::time_point<clock_type> g_prev_entry_time;
 static bool g_first_callback = true;
+static std::atomic<double> g_last_texec_us{0.0};
+static std::atomic<double> g_sum_texec_us{0.0};
+static std::atomic<double> g_max_texec_us{0.0};
+static std::atomic<size_t> g_underrun_count{0};
+static std::atomic<size_t> g_live_seq{0};
+static std::atomic<double> g_live_texec[LIVE_HISTORY];
 
 // Pre-allocated Audio Synthesis State
 struct SynthState {
@@ -36,6 +48,115 @@ struct SynthState {
     double phase_increment = (TWO_PI * SINE_FREQ) / SAMPLE_RATE;
     float amplitude = 0.25f;
 } g_synth;
+
+static void atomic_add(std::atomic<double>& target, double value) {
+    double current = target.load(std::memory_order_relaxed);
+    while (!target.compare_exchange_weak(
+        current,
+        current + value,
+        std::memory_order_relaxed,
+        std::memory_order_relaxed
+    )) {
+    }
+}
+
+static std::string format_bar(double value, double maximum, size_t width = 28) {
+    if (maximum <= 0.0) {
+        return std::string(width, '-');
+    }
+
+    double ratio = value / maximum;
+    if (ratio < 0.0) ratio = 0.0;
+    if (ratio > 1.0) ratio = 1.0;
+
+    size_t filled = static_cast<size_t>(std::lround(ratio * static_cast<double>(width)));
+    if (filled > width) filled = width;
+    return std::string(filled, '#') + std::string(width - filled, '-');
+}
+
+static std::string format_sparkline(size_t count, size_t seq) {
+    if (count == 0) {
+        return "";
+    }
+
+    const char* blocks = " .:-=+*#%@";
+    constexpr size_t block_count = 10;
+    size_t span = count < LIVE_HISTORY ? count : LIVE_HISTORY;
+    double values[LIVE_HISTORY];
+
+    for (size_t i = 0; i < span; ++i) {
+        size_t idx = (seq + LIVE_HISTORY - span + i) % LIVE_HISTORY;
+        values[i] = g_live_texec[idx].load(std::memory_order_relaxed);
+    }
+
+    double lo = values[0];
+    double hi = values[0];
+    for (size_t i = 1; i < span; ++i) {
+        if (values[i] < lo) lo = values[i];
+        if (values[i] > hi) hi = values[i];
+    }
+
+    if (hi <= lo) {
+        return std::string(span, blocks[block_count - 1]);
+    }
+
+    std::string out;
+    out.reserve(span);
+    for (size_t i = 0; i < span; ++i) {
+        double ratio = (values[i] - lo) / (hi - lo);
+        size_t block = static_cast<size_t>(std::lround(ratio * static_cast<double>(block_count - 1)));
+        if (block >= block_count) block = block_count - 1;
+        out.push_back(blocks[block]);
+    }
+    return out;
+}
+
+static std::string build_live_dashboard_line() {
+    size_t count = g_metric_count.load(std::memory_order_acquire);
+    if (count == 0) {
+        return "[LIVE] waiting for first callback...";
+    }
+
+    double latest_texec = g_last_texec_us.load(std::memory_order_relaxed);
+    double avg_texec = g_sum_texec_us.load(std::memory_order_relaxed) / static_cast<double>(count);
+    double max_texec = g_max_texec_us.load(std::memory_order_relaxed);
+    size_t underruns = g_underrun_count.load(std::memory_order_relaxed);
+    size_t seq = g_live_seq.load(std::memory_order_relaxed);
+    std::string bar = format_bar(latest_texec, DEADLINE_US);
+    std::string spark = format_sparkline(count, seq);
+
+    std::ostringstream oss;
+    oss.setf(std::ios::fixed);
+    oss << std::setprecision(1);
+    oss << "[LIVE] " << std::setw(5) << count << " callbacks"
+        << " | last " << std::setw(7) << latest_texec << " us "
+        << "[" << bar << "] " << std::setw(5) << (latest_texec / DEADLINE_US * 100.0) << "%"
+        << " | avg " << std::setw(7) << avg_texec << " us"
+        << " | max " << std::setw(7) << max_texec << " us"
+        << " | underruns " << underruns
+        << " | " << spark;
+    return oss.str();
+}
+
+static void render_live_dashboard(double duration_sec) {
+    using namespace std::chrono;
+    auto start = steady_clock::now();
+    auto next_tick = start;
+    const auto refresh = milliseconds(100);
+
+    while (duration_cast<duration<double>>(steady_clock::now() - start).count() < duration_sec) {
+        auto now = steady_clock::now();
+        if (now < next_tick) {
+            std::this_thread::sleep_for(std::min(milliseconds(20), duration_cast<milliseconds>(next_tick - now)));
+            continue;
+        }
+
+        next_tick = now + refresh;
+        std::cout << "\r\x1b[2K" << build_live_dashboard_line() << std::flush;
+    }
+
+    std::cout << std::endl;
+}
 
 // Real-Time Audio Callback (Zero Heap Allocations)
 static int paCallback(
@@ -85,12 +206,32 @@ static int paCallback(
     int underrun_flag = (driver_underrun || deadline_overrun) ? 1 : 0;
 
     // Record into pre-allocated memory
-    if (g_metric_count < MAX_RECORDS) {
-        g_metrics[g_metric_count].timestamp_sec = elapsed_sec;
-        g_metrics[g_metric_count].t_exec_us = t_exec_us;
-        g_metrics[g_metric_count].dt_arrival_us = dt_arrival_us;
-        g_metrics[g_metric_count].underrun_flag = underrun_flag;
-        g_metric_count++;
+    size_t idx = g_metric_count.load(std::memory_order_relaxed);
+    if (idx < MAX_RECORDS) {
+        g_metrics[idx].timestamp_sec = elapsed_sec;
+        g_metrics[idx].t_exec_us = t_exec_us;
+        g_metrics[idx].dt_arrival_us = dt_arrival_us;
+        g_metrics[idx].underrun_flag = underrun_flag;
+
+        g_last_texec_us.store(t_exec_us, std::memory_order_relaxed);
+        atomic_add(g_sum_texec_us, t_exec_us);
+
+        double prev_max = g_max_texec_us.load(std::memory_order_relaxed);
+        while (t_exec_us > prev_max && !g_max_texec_us.compare_exchange_weak(
+                   prev_max,
+                   t_exec_us,
+                   std::memory_order_relaxed,
+                   std::memory_order_relaxed)) {
+        }
+
+        if (underrun_flag) {
+            g_underrun_count.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        size_t slot = g_live_seq.fetch_add(1, std::memory_order_relaxed) % LIVE_HISTORY;
+        g_live_texec[slot].store(t_exec_us, std::memory_order_relaxed);
+
+        g_metric_count.store(idx + 1, std::memory_order_release);
     }
 
     return paContinue;
@@ -158,8 +299,8 @@ int main() {
         return 1;
     }
 
-    // Sleep on master thread while audio thread processes real-time callbacks
-    Pa_Sleep(static_cast<long>(RUN_DURATION_SEC * 1000.0));
+    std::cout << "[+] Stream active. Running 10-second benchmark..." << std::endl;
+    render_live_dashboard(RUN_DURATION_SEC);
 
     err = Pa_StopStream(stream);
     if (err != paNoError) {
@@ -169,7 +310,8 @@ int main() {
     Pa_CloseStream(stream);
     Pa_Terminate();
 
-    std::cout << "[+] Stream complete. Recorded " << g_metric_count << " callbacks." << std::endl;
+    size_t metric_count = g_metric_count.load(std::memory_order_acquire);
+    std::cout << "[+] Stream complete. Recorded " << metric_count << " callbacks." << std::endl;
     std::cout << "[+] Exporting metrics to cpp_metrics.csv..." << std::endl;
 
     std::ofstream csv("cpp_metrics.csv");
@@ -183,7 +325,7 @@ int main() {
     double max_texec = 0.0;
     double sum_texec = 0.0;
 
-    for (size_t i = 0; i < g_metric_count; ++i) {
+    for (size_t i = 0; i < metric_count; ++i) {
         csv << i << ","
             << g_metrics[i].timestamp_sec << ","
             << g_metrics[i].t_exec_us << ","
@@ -201,7 +343,7 @@ int main() {
     csv.close();
 
     std::cout << "[+] Exported to cpp_metrics.csv successfully.\n";
-    std::cout << "    - Mean T_exec:  " << (g_metric_count > 0 ? (sum_texec / g_metric_count) : 0.0) << " us\n";
+    std::cout << "    - Mean T_exec:  " << (metric_count > 0 ? (sum_texec / metric_count) : 0.0) << " us\n";
     std::cout << "    - Max T_exec:   " << max_texec << " us\n";
     std::cout << "    - Underruns:    " << deadline_violations << "\n";
 

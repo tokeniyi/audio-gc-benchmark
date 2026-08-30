@@ -10,6 +10,8 @@ import csv
 import os
 import subprocess
 import sys
+import threading
+import time
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -18,6 +20,12 @@ DEADLINE_MS = 128.0 / 44.1  # ~2.90249 ms
 DEADLINE_US = DEADLINE_MS * 1000.0
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 PROJECT_VENV_PYTHON = os.path.join(PROJECT_ROOT, ".venv", "Scripts", "python.exe")
+RUNNER_STAGE_PLAN = [
+    ("compile", "Compiling C++ engine", 1.0),
+    ("cpp", "Running C++ benchmark", 10.0),
+    ("python", "Running Python benchmark", 10.0),
+    ("analysis", "Computing stats & plot", 1.0),
+]
 
 
 def resolve_python_executable():
@@ -33,6 +41,57 @@ def resolve_python_executable():
         "  python -m venv .venv\n"
         "then install dependencies inside .venv before running this benchmark."
     )
+
+
+def _format_bar(value, maximum, width=28, fill="#", empty="-"):
+    if maximum <= 0:
+        return empty * width
+    ratio = max(0.0, min(1.0, value / maximum))
+    filled = int(round(ratio * width))
+    filled = max(0, min(width, filled))
+    return fill * filled + empty * (width - filled)
+
+
+def _dashboard_loop(state, stop_event):
+    total_expected = sum(stage[2] for stage in RUNNER_STAGE_PLAN)
+    while not stop_event.is_set():
+        stage_key = state.get("stage", "idle")
+        stage_label = state.get("stage_label", stage_key)
+        stage_start = state.get("stage_start", time.monotonic())
+        stage_expected = state.get("stage_expected", 1.0)
+        current = time.monotonic()
+        stage_elapsed = max(0.0, current - stage_start)
+        completed_expected = state.get("completed_expected", 0.0)
+        overall_done = min(total_expected, completed_expected + min(stage_elapsed, stage_expected))
+        overall_pct = (overall_done / total_expected) * 100.0 if total_expected > 0 else 0.0
+        bar = _format_bar(overall_done, total_expected, width=30)
+        detail = state.get("detail", "")
+
+        line1 = f"[RUNNER] overall [{bar}] {overall_pct:5.1f}% | stage: {stage_label}"
+        line2 = f"         stage elapsed {stage_elapsed:5.1f}s / {stage_expected:4.1f}s | {detail}"
+        sys.stdout.write("\r\x1b[2K" + line1 + "\n" + "\r\x1b[2K" + line2)
+        sys.stdout.flush()
+        time.sleep(0.25)
+
+    final_note = state.get("final_note")
+    if final_note:
+        sys.stdout.write("\r\x1b[2K" + final_note + "\n")
+        sys.stdout.flush()
+
+
+def _run_stage(stage_state, key, label, expected, detail, func):
+    stage_state["stage"] = key
+    stage_state["stage_label"] = label
+    stage_state["stage_start"] = time.monotonic()
+    stage_state["stage_expected"] = expected
+    stage_state["detail"] = detail
+    ok = func()
+    if ok:
+        stage_state["completed_expected"] = min(
+            sum(stage[2] for stage in RUNNER_STAGE_PLAN),
+            stage_state.get("completed_expected", 0.0) + expected,
+        )
+    return ok
 
 def compile_cpp():
     print("\n========================================================")
@@ -226,15 +285,42 @@ def generate_plots(cpp_metrics, py_metrics, output_file="latency_comparison.png"
     print(f"[+] Saved visualization plot to: {output_file}")
 
 def main():
-    if not compile_cpp():
+    stage_state = {
+        "stage": "idle",
+        "stage_label": "Starting",
+        "stage_start": time.monotonic(),
+        "stage_expected": 1.0,
+        "completed_expected": 0.0,
+        "detail": "Preparing benchmark pipeline...",
+    }
+    stop_event = threading.Event()
+    dashboard = threading.Thread(target=_dashboard_loop, args=(stage_state, stop_event), daemon=True)
+    dashboard.start()
+
+    if not _run_stage(stage_state, "compile", "Compiling C++ engine", 1.0, "Building cpp_jitter_test.exe", compile_cpp):
+        stop_event.set()
+        stage_state["final_note"] = "[RUNNER] benchmark pipeline aborted during compile"
+        dashboard.join(timeout=1.0)
         sys.exit(1)
-        
-    if not run_cpp_benchmark():
+
+    if not _run_stage(stage_state, "cpp", "Running C++ benchmark", 10.0, "Executing cpp_jitter_test.exe", run_cpp_benchmark):
+        stop_event.set()
+        stage_state["final_note"] = "[RUNNER] benchmark pipeline aborted during C++ run"
+        dashboard.join(timeout=1.0)
         sys.exit(1)
-        
-    if not run_py_benchmark():
+
+    if not _run_stage(stage_state, "python", "Running Python benchmark", 10.0, "Executing py_jitter_test.py", run_py_benchmark):
+        stop_event.set()
+        stage_state["final_note"] = "[RUNNER] benchmark pipeline aborted during Python run"
+        dashboard.join(timeout=1.0)
         sys.exit(1)
-        
+
+    stage_state["stage"] = "analysis"
+    stage_state["stage_label"] = "Computing stats & plot"
+    stage_state["stage_start"] = time.monotonic()
+    stage_state["stage_expected"] = 1.0
+    stage_state["detail"] = "Loading CSV files, printing summary, generating plot"
+
     print("\n[+] Processing benchmark datasets...")
     cpp_data = load_metrics("cpp_metrics.csv")
     py_data = load_metrics("py_metrics.csv")
@@ -244,6 +330,11 @@ def main():
     
     print_comparison_table(cpp_stats, py_stats)
     generate_plots(cpp_data, py_data, "latency_comparison.png")
+
+    stage_state["completed_expected"] = sum(stage[2] for stage in RUNNER_STAGE_PLAN)
+    stage_state["final_note"] = "[RUNNER] benchmark pipeline complete"
+    stop_event.set()
+    dashboard.join(timeout=1.0)
 
 if __name__ == "__main__":
     main()
