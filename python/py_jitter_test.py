@@ -23,6 +23,10 @@ DEADLINE_US = DEADLINE_MS * 1000.0                  # ~2902.49 us
 RUN_DURATION_SEC = 10.0
 MAX_RECORDS = 10000
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
+PY_METRICS_PATH = os.path.join(PROJECT_ROOT, "py_metrics.csv")
+
 
 def _format_bar(value, maximum, width=24, fill="#", empty="-"):
     if maximum <= 0:
@@ -149,7 +153,7 @@ class PythonJitterBenchmark:
         print(f"[+] Stream complete. Recorded {len(self.records)} callbacks.")
         print("[+] Exporting metrics to py_metrics.csv...")
 
-        with open("py_metrics.csv", "w", newline="") as f:
+        with open(PY_METRICS_PATH, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["callback_index", "timestamp_sec", "t_exec_us", "dt_arrival_us", "underrun_flag"])
             writer.writerows(self.records)

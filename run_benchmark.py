@@ -16,10 +16,16 @@ import time
 import matplotlib.pyplot as plt
 import numpy as np
 
-DEADLINE_MS = 128.0 / 44.1  # ~2.90249 ms
-DEADLINE_US = DEADLINE_MS * 1000.0
+# ---------------------------------------------------------------------------
+# Base paths – assume this file lives at the project root alongside
+# the ``cpp/`` and ``python/`` subfolders that hold each engine's source.
+# ---------------------------------------------------------------------------
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+CPP_DIR = os.path.join(PROJECT_ROOT, "cpp")
+PY_DIR = os.path.join(PROJECT_ROOT, "python")
 PROJECT_VENV_PYTHON = os.path.join(PROJECT_ROOT, ".venv", "Scripts", "python.exe")
+
+# How long each stage runs (seconds).  Used by the live progress dashboard.
 RUNNER_STAGE_PLAN = [
     ("compile", "Compiling C++ engine", 1.0),
     ("cpp", "Running C++ benchmark", 10.0),
@@ -27,6 +33,10 @@ RUNNER_STAGE_PLAN = [
     ("analysis", "Computing stats & plot", 1.0),
 ]
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def resolve_python_executable():
     """Resolve the interpreter used to run the Python benchmark.
@@ -93,11 +103,24 @@ def _run_stage(stage_state, key, label, expected, detail, func):
         )
     return ok
 
+
+# ---------------------------------------------------------------------------
+# Stage implementations
+# ---------------------------------------------------------------------------
+
 def compile_cpp():
     print("\n========================================================")
     print(" [1/4] Compiling C++ Real-Time Audio Engine")
     print("========================================================")
-    cmd = ["g++", "-O3", "-std=c++17", "cpp_jitter_test.cpp", "-o", "cpp_jitter_test.exe", "portaudio.dll"]
+    cmd = [
+        "g++",
+        "-O3",
+        "-std=c++17",
+        os.path.join(CPP_DIR, "cpp_jitter_test.cpp"),
+        "-o",
+        os.path.join(CPP_DIR, "cpp_jitter_test.exe"),
+        os.path.join(CPP_DIR, "portaudio.dll"),
+    ]
     print(f"Executing: {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -106,16 +129,18 @@ def compile_cpp():
     print("[+] C++ engine compiled successfully -> cpp_jitter_test.exe")
     return True
 
+
 def run_cpp_benchmark():
     print("\n========================================================")
     print(" [2/4] Executing C++ Engine (Zero-Allocation Hot Path)")
     print("========================================================")
-    cmd = [".\\cpp_jitter_test.exe"]
-    result = subprocess.run(cmd)
+    cmd = [os.path.join(CPP_DIR, "cpp_jitter_test.exe")]
+    result = subprocess.run(cmd, cwd=CPP_DIR)
     if result.returncode != 0:
         print("[-] C++ benchmark execution failed!", file=sys.stderr)
         return False
     return True
+
 
 def run_py_benchmark():
     print("\n========================================================")
@@ -124,17 +149,18 @@ def run_py_benchmark():
     python_exe = resolve_python_executable()
     print(f"Using project-local .venv interpreter: {python_exe}")
 
-    cmd = [python_exe, "py_jitter_test.py"]
+    cmd = [python_exe, os.path.join(PY_DIR, "py_jitter_test.py")]
     result = subprocess.run(cmd)
     if result.returncode != 0:
         print("[-] Python benchmark execution failed!", file=sys.stderr)
         return False
     return True
 
+
 def load_metrics(filename):
     if not os.path.exists(filename):
         raise FileNotFoundError(f"Metrics file {filename} not found!")
-    
+
     indices, timestamps, texec_us, dt_arrival_us, underruns = [], [], [], [], []
     with open(filename, "r") as f:
         reader = csv.DictReader(f)
@@ -144,7 +170,7 @@ def load_metrics(filename):
             texec_us.append(float(row["t_exec_us"]))
             dt_arrival_us.append(float(row["dt_arrival_us"]))
             underruns.append(int(row["underrun_flag"]))
-            
+
     return {
         "indices": np.array(indices),
         "timestamps": np.array(timestamps),
@@ -153,13 +179,14 @@ def load_metrics(filename):
         "underruns": np.array(underruns),
     }
 
+
 def compute_statistics(metrics):
     t = metrics["texec_us"]
     underruns = metrics["underruns"]
     total = len(t)
     if total == 0:
         return {}
-    
+
     mean_val = np.mean(t)
     std_val = np.std(t, ddof=1) if total > 1 else 0.0
     p50_val = np.percentile(t, 50)
@@ -183,6 +210,7 @@ def compute_statistics(metrics):
         "violation_pct": violation_pct,
     }
 
+
 def print_comparison_table(cpp_stats, py_stats):
     print("\n==========================================================================================")
     print("                         AUDIO CALLBACK BENCHMARK SUMMARY REPORT                          ")
@@ -192,7 +220,7 @@ def print_comparison_table(cpp_stats, py_stats):
     header = f"{'Metric':<32} | {'C++ (Zero-Alloc)':<25} | {'Python (GC Churn)':<25}"
     print(header)
     print("-" * len(header))
-    
+
     rows = [
         ("Total Callbacks", f"{cpp_stats['total_callbacks']:,}", f"{py_stats['total_callbacks']:,}"),
         ("Mean T_exec", f"{cpp_stats['mean_us']:.2f} us ({cpp_stats['mean_us']/1000:.4f} ms)", f"{py_stats['mean_us']:.2f} us ({py_stats['mean_us']/1000:.4f} ms)"),
@@ -204,7 +232,7 @@ def print_comparison_table(cpp_stats, py_stats):
         ("Buffer Underruns Logged", f"{cpp_stats['underruns']}", f"{py_stats['underruns']}"),
         ("Deadline Violations (>T_max)", f"{cpp_stats['violations']} ({cpp_stats['violation_pct']:.2f}%)", f"{py_stats['violations']} ({py_stats['violation_pct']:.2f}%)"),
     ]
-    
+
     for label, cpp_val, py_val in rows:
         print(f"{label:<32} | {cpp_val:<25} | {py_val:<25}")
     print("==========================================================================================\n")
@@ -218,71 +246,73 @@ def print_comparison_table(cpp_stats, py_stats):
     print(f" [Python Engine] GC Latency Spikes > 2.902 ms:  {'[PASS]' if py_spikes else '[FAIL]'}")
     print("==========================================================================================\n")
 
+
 def generate_plots(cpp_metrics, py_metrics, output_file="latency_comparison.png"):
     print("\n========================================================")
     print(" [4/4] Generating Latency Comparison Visualization")
     print("========================================================")
-    
+
     plt.style.use("seaborn-v0_8-whitegrid" if "seaborn-v0_8-whitegrid" in plt.style.available else "default")
     fig, axes = plt.subplots(3, 1, figsize=(14, 12), dpi=150)
-    fig.patch.set_facecolor('#0f172a')
-    
+    fig.patch.set_facecolor("#0f172a")
+
     for ax in axes:
-        ax.set_facecolor('#1e293b')
-        ax.grid(True, color='#334155', linestyle='--', alpha=0.6)
-        ax.tick_params(colors='#e2e8f0', labelsize=10)
+        ax.set_facecolor("#1e293b")
+        ax.grid(True, color="#334155", linestyle="--", alpha=0.6)
+        ax.tick_params(colors="#e2e8f0", labelsize=10)
         for spine in ax.spines.values():
-            spine.set_color('#475569')
+            spine.set_color("#475569")
 
     # Subplot 1: Time Series Latency vs Elapsed Time
     ax1 = axes[0]
-    ax1.plot(cpp_metrics["timestamps"], cpp_metrics["texec_us"] / 1000.0, 
-             color='#38bdf8', alpha=0.85, linewidth=1.2, label="C++ (Zero-Alloc Real-Time PortAudio)")
-    ax1.plot(py_metrics["timestamps"], py_metrics["texec_us"] / 1000.0, 
-             color='#f43f5e', alpha=0.8, linewidth=1.0, label="Python (Active GC Heap Churn)")
-    
+    ax1.plot(cpp_metrics["timestamps"], cpp_metrics["texec_us"] / 1000.0,
+             color="#38bdf8", alpha=0.85, linewidth=1.2, label="C++ (Zero-Alloc Real-Time PortAudio)")
+    ax1.plot(py_metrics["timestamps"], py_metrics["texec_us"] / 1000.0,
+             color="#f43f5e", alpha=0.8, linewidth=1.0, label="Python (Active GC Heap Churn)")
+
     # Real-Time Deadline Threshold
-    ax1.axhline(DEADLINE_MS, color='#facc15', linestyle='--', linewidth=2.0, 
+    ax1.axhline(DEADLINE_MS, color="#facc15", linestyle="--", linewidth=2.0,
                 label=f"Real-Time Deadline $T_{{max}} = {DEADLINE_MS:.3f}$ ms (128 frames @ 44.1 kHz)")
-    
-    ax1.set_title("Audio Callback Execution Time ($T_{exec}$) Over Time", color='#f8fafc', fontsize=14, fontweight='bold', pad=10)
-    ax1.set_xlabel("Elapsed Time (seconds)", color='#cbd5e1', fontsize=11)
-    ax1.set_ylabel("Execution Time $T_{exec}$ (ms)", color='#cbd5e1', fontsize=11)
-    ax1.legend(loc='upper right', facecolor='#0f172a', edgecolor='#475569', labelcolor='#f8fafc', fontsize=10)
+
+    ax1.set_title("Audio Callback Execution Time ($T_{exec}$) Over Time", color="#f8fafc", fontsize=14, fontweight='bold', pad=10)
+    ax1.set_xlabel("Elapsed Time (seconds)", color="#cbd5e1", fontsize=11)
+    ax1.set_ylabel("Execution Time $T_{exec}$ (ms)", color="#cbd5e1", fontsize=11)
+    ax1.legend(loc='upper right', facecolor="#0f172a", edgecolor="#475569", labelcolor="#f8fafc", fontsize=10)
 
     # Subplot 2: Histogram / Distribution
     ax2 = axes[1]
     cpp_ms = cpp_metrics["texec_us"] / 1000.0
     py_ms = py_metrics["texec_us"] / 1000.0
-    
+
     max_range = max(np.max(cpp_ms), np.max(py_ms), DEADLINE_MS * 1.1)
     bins = np.linspace(0, max_range, 120)
-    ax2.hist(cpp_ms, bins=bins, color='#38bdf8', alpha=0.7, label="C++ Latency Distribution", density=True)
-    ax2.hist(py_ms, bins=bins, color='#f43f5e', alpha=0.6, label="Python Latency Distribution (GC Spikes)", density=True)
-    ax2.axvline(DEADLINE_MS, color='#facc15', linestyle='--', linewidth=2.0, label=f"Deadline $T_{{max}} = {DEADLINE_MS:.3f}$ ms")
-    
+    ax2.hist(cpp_ms, bins=bins, color="#38bdf8", alpha=0.7, label="C++ Latency Distribution", density=True)
+    ax2.hist(py_ms, bins=bins, color="#f43f5e", alpha=0.6, label="Python Latency Distribution (GC Spikes)", density=True)
+    ax2.axvline(DEADLINE_MS, color="#facc15", linestyle="--", linewidth=2.0, label=f"Deadline $T_{{max}} = {DEADLINE_MS:.3f}$ ms")
+
     ax2.set_yscale('log')
-    ax2.set_title("Execution Time Distribution & Tail Latencies (Log Scale)", color='#f8fafc', fontsize=14, fontweight='bold', pad=10)
-    ax2.set_xlabel("Execution Time $T_{exec}$ (ms)", color='#cbd5e1', fontsize=11)
-    ax2.set_ylabel("Probability Density (Log)", color='#cbd5e1', fontsize=11)
-    ax2.legend(loc='upper right', facecolor='#0f172a', edgecolor='#475569', labelcolor='#f8fafc', fontsize=10)
+    ax2.set_title("Execution Time Distribution & Tail Latencies (Log Scale)", color="#f8fafc", fontsize=14, fontweight='bold', pad=10)
+    ax2.set_xlabel("Execution Time $T_{exec}$ (ms)", color="#cbd5e1", fontsize=11)
+    ax2.set_ylabel("Probability Density (Log)", color="#cbd5e1", fontsize=11)
+    ax2.legend(loc='upper right', facecolor="#0f172a", edgecolor="#475569", labelcolor="#f8fafc", fontsize=10)
 
     # Subplot 3: Inter-Arrival Delta T_arrival
     ax3 = axes[2]
     ax3.plot(cpp_metrics["timestamps"][1:], cpp_metrics["dt_arrival_us"][1:] / 1000.0,
-             color='#34d399', alpha=0.75, linewidth=1.0, label=r"C++ Callback Inter-Arrival Interval ($\Delta T_{arrival}$)")
+             color="#34d399", alpha=0.75, linewidth=1.0, label=r"C++ Callback Inter-Arrival Interval ($\Delta T_{arrival}$)")
     ax3.plot(py_metrics["timestamps"][1:], py_metrics["dt_arrival_us"][1:] / 1000.0,
-             color='#fb923c', alpha=0.65, linewidth=1.0, label=r"Python Callback Inter-Arrival Interval ($\Delta T_{arrival}$)")
-    ax3.axhline(DEADLINE_MS, color='#facc15', linestyle=':', linewidth=1.5, label=f"Expected Period ($128/44100 \\approx {DEADLINE_MS:.3f}$ ms)")
-    
-    ax3.set_title(r"Callback Inter-Arrival Jitter ($\Delta T_{arrival}$)", color='#f8fafc', fontsize=14, fontweight='bold', pad=10)
-    ax3.set_xlabel("Elapsed Time (seconds)", color='#cbd5e1', fontsize=11)
-    ax3.set_ylabel(r"Arrival Delta $\Delta T$ (ms)", color='#cbd5e1', fontsize=11)
-    ax3.legend(loc='upper right', facecolor='#0f172a', edgecolor='#475569', labelcolor='#f8fafc', fontsize=10)
+             color="#fb923c", alpha=0.65, linewidth=1.0, label=r"Python Callback Inter-Arrival Interval ($\Delta T_{arrival}$)")
+    ax3.axhline(DEADLINE_MS, color="#facc15", linestyle=":", linewidth=1.5, label=f"Expected Period ($128/44100 \approx {DEADLINE_MS:.3f}$ ms)")
+
+    ax3.set_title(r"Callback Inter-Arrival Jitter ($\Delta T_{arrival}$)", color="#f8fafc", fontsize=14, fontweight='bold', pad=10)
+    ax3.set_xlabel("Elapsed Time (seconds)", color="#cbd5e1", fontsize=11)
+    ax3.set_ylabel("Arrival Delta $\Delta T$ (ms)", color="#cbd5e1", fontsize=11)
+    ax3.legend(loc='upper right', facecolor="#0f172a", edgecolor="#475569", labelcolor="#f8fafc", fontsize=10)
 
     plt.tight_layout()
     plt.savefig(output_file, dpi=150, facecolor=fig.get_facecolor(), edgecolor='none')
     print(f"[+] Saved visualization plot to: {output_file}")
+
 
 def main():
     stage_state = {
@@ -297,19 +327,22 @@ def main():
     dashboard = threading.Thread(target=_dashboard_loop, args=(stage_state, stop_event), daemon=True)
     dashboard.start()
 
-    if not _run_stage(stage_state, "compile", "Compiling C++ engine", 1.0, "Building cpp_jitter_test.exe", compile_cpp):
+    if not _run_stage(stage_state, "compile", "Compiling C++ engine", 1.0,
+                      "Building cpp_jitter_test.exe", compile_cpp):
         stop_event.set()
         stage_state["final_note"] = "[RUNNER] benchmark pipeline aborted during compile"
         dashboard.join(timeout=1.0)
         sys.exit(1)
 
-    if not _run_stage(stage_state, "cpp", "Running C++ benchmark", 10.0, "Executing cpp_jitter_test.exe", run_cpp_benchmark):
+    if not _run_stage(stage_state, "cpp", "Running C++ benchmark", 10.0,
+                      "Executing cpp_jitter_test.exe", run_cpp_benchmark):
         stop_event.set()
         stage_state["final_note"] = "[RUNNER] benchmark pipeline aborted during C++ run"
         dashboard.join(timeout=1.0)
         sys.exit(1)
 
-    if not _run_stage(stage_state, "python", "Running Python benchmark", 10.0, "Executing py_jitter_test.py", run_py_benchmark):
+    if not _run_stage(stage_state, "python", "Running Python benchmark", 10.0,
+                      "Executing py_jitter_test.py", run_py_benchmark):
         stop_event.set()
         stage_state["final_note"] = "[RUNNER] benchmark pipeline aborted during Python run"
         dashboard.join(timeout=1.0)
@@ -321,20 +354,25 @@ def main():
     stage_state["stage_expected"] = 1.0
     stage_state["detail"] = "Loading CSV files, printing summary, generating plot"
 
+    cpp_csv = os.path.join(CPP_DIR, "cpp_metrics.csv")
+    py_csv = os.path.join(PY_DIR, "py_metrics.csv")
+    png = os.path.join(PROJECT_ROOT, "latency_comparison.png")
+
     print("\n[+] Processing benchmark datasets...")
-    cpp_data = load_metrics("cpp_metrics.csv")
-    py_data = load_metrics("py_metrics.csv")
-    
+    cpp_data = load_metrics(cpp_csv)
+    py_data = load_metrics(py_csv)
+
     cpp_stats = compute_statistics(cpp_data)
     py_stats = compute_statistics(py_data)
-    
+
     print_comparison_table(cpp_stats, py_stats)
-    generate_plots(cpp_data, py_data, "latency_comparison.png")
+    generate_plots(cpp_data, py_data, png)
 
     stage_state["completed_expected"] = sum(stage[2] for stage in RUNNER_STAGE_PLAN)
     stage_state["final_note"] = "[RUNNER] benchmark pipeline complete"
     stop_event.set()
     dashboard.join(timeout=1.0)
+
 
 if __name__ == "__main__":
     main()
