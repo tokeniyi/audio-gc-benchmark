@@ -1,0 +1,48 @@
+# Build artifacts
+*.exe
+*.o
+*.obj
+*.lib
+*.a
+*.so
+*.dylib
+
+# Build directory
+build/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Generated data files
+*.csv
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.svg
+*.pdf
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+Thumbs.db
+.DS_Store
+Desktop.ini
+
+# Compiled DLLs (third-party dependencies)
+*.dll
