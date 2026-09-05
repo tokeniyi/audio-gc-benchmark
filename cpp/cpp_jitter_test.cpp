@@ -314,7 +314,13 @@ int main() {
     std::cout << "[+] Stream complete. Recorded " << metric_count << " callbacks." << std::endl;
     std::cout << "[+] Exporting metrics to cpp_metrics.csv..." << std::endl;
 
-    std::ofstream csv("cpp_metrics.csv");
+    TCHAR exe_path[MAX_PATH];
+    GetModuleFileName(NULL, exe_path, MAX_PATH);
+    TCHAR exe_dir[MAX_PATH];
+    lstrcpy(exe_dir, exe_path);
+    PathRemoveFileSpec(exe_dir);
+    std::string csv_path = std::string(exe_dir) + "\cpp_metrics.csv";
+    std::ofstream csv(csv_path);
     if (!csv.is_open()) {
         std::cerr << "[-] Error opening cpp_metrics.csv for writing!\n";
         return 1;

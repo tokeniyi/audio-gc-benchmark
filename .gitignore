@@ -31,6 +31,9 @@ env/
 *.gif
 *.svg
 *.pdf
+*.pyc
+*.pyo
+*.pyd
 
 # IDE / Editor
 .vscode/
@@ -46,3 +49,9 @@ Desktop.ini
 
 # Compiled DLLs (third-party dependencies)
 *.dll
+
+# Runtime output
+output/
+
+# Exercises
+cpp/exercises/

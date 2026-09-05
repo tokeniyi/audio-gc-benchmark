@@ -13,6 +13,11 @@ import sys
 import threading
 import time
 
+# Real-time deadline: 128 frames @ 44.1 kHz
+# 128 / 44100 * 1000 = ~2.902 ms
+DEADLINE_MS = 2.902
+DEADLINE_US = DEADLINE_MS * 1000  # 2902.0
+
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -372,6 +377,7 @@ def main():
     stage_state["final_note"] = "[RUNNER] benchmark pipeline complete"
     stop_event.set()
     dashboard.join(timeout=1.0)
+    sys.stdout.flush()
 
 
 if __name__ == "__main__":
