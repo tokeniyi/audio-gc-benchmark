@@ -1,3 +1,7 @@
+//============================================================================
+// C++ Real-Time Audio Callback Jitter Benchmark (PortAudio)
+//============================================================================
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -7,6 +11,7 @@
 #include <iostream>
 #include <sstream>
 #include <thread>
+#include <array>
 
 #include "portaudio.h"
 
@@ -21,6 +26,15 @@ constexpr double RUN_DURATION_SEC = 10.0;
 constexpr size_t MAX_RECORDS = 10000; // Pre-allocated storage for ~3,445 callbacks
 constexpr size_t LIVE_HISTORY = 32;
 
+// Block sizes for sweep testing
+const unsigned long BLOCK_SIZES[5] = {128, 64, 256, 512, 1024};
+const size_t NUM_BLOCK_SIZES = 5;
+
+// Sample rates for sweep testing
+const double SAMPLE_RATES[3] = {44100.0, 48000.0, 96000.0};
+const size_t NUM_SAMPLE_RATES = 3;
+
+// Struct for storing callback metrics
 struct CallbackMetric {
     double timestamp_sec;
     double t_exec_us;
@@ -49,31 +63,31 @@ struct SynthState {
     float amplitude = 0.25f;
 } g_synth;
 
+// Helper: atomic add
 static void atomic_add(std::atomic<double>& target, double value) {
     double current = target.load(std::memory_order_relaxed);
     while (!target.compare_exchange_weak(
-        current,
-        current + value,
-        std::memory_order_relaxed,
-        std::memory_order_relaxed
-    )) {
+                current,
+                current + value,
+                std::memory_order_relaxed,
+                std::memory_order_relaxed)) {
     }
 }
 
+// Format a progress bar
 static std::string format_bar(double value, double maximum, size_t width = 28) {
     if (maximum <= 0.0) {
         return std::string(width, '-');
     }
-
     double ratio = value / maximum;
     if (ratio < 0.0) ratio = 0.0;
     if (ratio > 1.0) ratio = 1.0;
-
     size_t filled = static_cast<size_t>(std::lround(ratio * static_cast<double>(width)));
     if (filled > width) filled = width;
     return std::string(filled, '#') + std::string(width - filled, '-');
 }
 
+// Format a sparkline
 static std::string format_sparkline(size_t count, size_t seq) {
     if (count == 0) {
         return "";
@@ -111,6 +125,7 @@ static std::string format_sparkline(size_t count, size_t seq) {
     return out;
 }
 
+// Build live dashboard line
 static std::string build_live_dashboard_line() {
     size_t count = g_metric_count.load(std::memory_order_acquire);
     if (count == 0) {
@@ -138,6 +153,7 @@ static std::string build_live_dashboard_line() {
     return oss.str();
 }
 
+// Render live dashboard
 static void render_live_dashboard(double duration_sec) {
     using namespace std::chrono;
     auto start = steady_clock::now();
@@ -150,11 +166,9 @@ static void render_live_dashboard(double duration_sec) {
             std::this_thread::sleep_for(std::min(milliseconds(20), duration_cast<milliseconds>(next_tick - now)));
             continue;
         }
-
         next_tick = now + refresh;
-        std::cout << "\r\x1b[2K" << build_live_dashboard_line() << std::flush;
+        std::cout << "[2K" << build_live_dashboard_line() << std::flush;
     }
-
     std::cout << std::endl;
 }
 
@@ -238,16 +252,16 @@ static int paCallback(
 }
 
 int main() {
-    std::cout << "========================================================\n"
-              << "  C++ Real-Time Audio Callback Jitter Benchmark (PortAudio)\n"
-              << "========================================================\n"
-              << "Sample Rate:     " << SAMPLE_RATE << " Hz\n"
-              << "Block Size:      " << BLOCK_SIZE << " frames\n"
-              << "Deadline (Tmax): " << DEADLINE_MS << " ms (" << DEADLINE_US << " us)\n"
-              << "Target Signal:   " << SINE_FREQ << " Hz Sine Wave\n"
-              << "Duration:        " << RUN_DURATION_SEC << " seconds\n"
-              << "Memory Policy:   Strict Zero Hot-Path Allocation\n"
-              << "--------------------------------------------------------" << std::endl;
+    std::cout << "========================================================" << std::endl;
+    std::cout << "  C++ Real-Time Audio Callback Jitter Benchmark (PortAudio)" << std::endl;
+    std::cout << "========================================================" << std::endl;
+    std::cout << "Sample Rate:     " << SAMPLE_RATE << " Hz" << std::endl;
+    std::cout << "Block Size:      " << BLOCK_SIZE << " frames" << std::endl;
+    std::cout << "Deadline (Tmax): " << DEADLINE_MS << " ms (" << DEADLINE_US << " us)" << std::endl;
+    std::cout << "Target Signal:   " << SINE_FREQ << " Hz Sine Wave" << std::endl;
+    std::cout << "Duration:        " << RUN_DURATION_SEC << " seconds" << std::endl;
+    std::cout << "Memory Policy:   Strict Zero Hot-Path Allocation" << std::endl;
+    std::cout << "--------------------------------------------------------" << std::endl;
 
     PaError err = Pa_Initialize();
     if (err != paNoError) {
@@ -314,19 +328,17 @@ int main() {
     std::cout << "[+] Stream complete. Recorded " << metric_count << " callbacks." << std::endl;
     std::cout << "[+] Exporting metrics to cpp_metrics.csv..." << std::endl;
 
-    TCHAR exe_path[MAX_PATH];
-    GetModuleFileName(NULL, exe_path, MAX_PATH);
-    TCHAR exe_dir[MAX_PATH];
-    lstrcpy(exe_dir, exe_path);
-    PathRemoveFileSpec(exe_dir);
-    std::string csv_path = std::string(exe_dir) + "\cpp_metrics.csv";
+    // Export metrics to CSV, writing to current working directory
+    std::string csv_path = "cpp_metrics.csv";
     std::ofstream csv(csv_path);
     if (!csv.is_open()) {
-        std::cerr << "[-] Error opening cpp_metrics.csv for writing!\n";
+        std::cerr << "[-] Error opening cpp_metrics.csv for writing!" << std::endl;
         return 1;
     }
 
-    csv << "callback_index,timestamp_sec,t_exec_us,dt_arrival_us,underrun_flag\n";
+    csv << "callback_index,timestamp_sec,t_exec_us,dt_arrival_us,underrun_flag
+";
+
     size_t deadline_violations = 0;
     double max_texec = 0.0;
     double sum_texec = 0.0;
@@ -336,7 +348,8 @@ int main() {
             << g_metrics[i].timestamp_sec << ","
             << g_metrics[i].t_exec_us << ","
             << g_metrics[i].dt_arrival_us << ","
-            << g_metrics[i].underrun_flag << "\n";
+            << g_metrics[i].underrun_flag << "
+";
 
         sum_texec += g_metrics[i].t_exec_us;
         if (g_metrics[i].t_exec_us > max_texec) {
@@ -348,10 +361,10 @@ int main() {
     }
     csv.close();
 
-    std::cout << "[+] Exported to cpp_metrics.csv successfully.\n";
-    std::cout << "    - Mean T_exec:  " << (metric_count > 0 ? (sum_texec / metric_count) : 0.0) << " us\n";
-    std::cout << "    - Max T_exec:   " << max_texec << " us\n";
-    std::cout << "    - Underruns:    " << deadline_violations << "\n";
+    std::cout << "[+] Exported to cpp_metrics.csv successfully." << std::endl;
+    std::cout << "    - Mean T_exec:  " << (metric_count > 0 ? (sum_texec / metric_count) : 0.0) << " us" << std::endl;
+    std::cout << "    - Max T_exec:   " << max_texec << " us" << std::endl;
+    std::cout << "    - Underruns:    " << deadline_violations << std::endl;
 
     return 0;
 }

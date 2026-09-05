@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Real-Time Audio Callback Jitter & GC Benchmark (Python Engine)
---------------------------------------------------------------
-Measures audio callback execution jitter, latency distribution, and GC-induced
-buffer underruns under sub-3ms real-time constraints (T_max ≈ 2.902 ms).
+Numba-JIT Real-Time Audio Callback Benchmark (Python Engine)
+----------------------------------------------------------------
+Uses Numba JIT compilation to minimize Python interpreter overhead while
+still demonstrating GC effects (or lack thereof) in real-time audio.
 """
 
 import os
@@ -13,6 +13,14 @@ import sys
 import gc
 import numpy as np
 import sounddevice as sd
+
+try:
+    from numba import njit
+    HAS_NUMBA = True
+except ImportError:
+    HAS_NUMBA = False
+    print("Numba not available - falling back to pure Python implementation",
+          file=sys.stderr)
 
 # Benchmark Constraints & Constants
 SAMPLE_RATE = 44100
@@ -26,7 +34,7 @@ MAX_RECORDS = 10000
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
-PY_METRICS_PATH = os.path.join(PROJECT_ROOT, "py_metrics.csv")
+PY_METRICS_PATH = os.path.join(PROJECT_ROOT, "py_metrics_numba.csv")
 
 
 def _format_bar(value, maximum, width=24, fill="#", empty="-"):
@@ -35,7 +43,7 @@ def _format_bar(value, maximum, width=24, fill="#", empty="-"):
     ratio = max(0.0, min(1.0, value / maximum))
     filled = int(round(ratio * width))
     filled = max(0, min(width, filled))
-    return fill * filled + empty * (width - formatted)
+    return fill * filled + empty * (width - filled)
 
 
 def _format_tail(values, width=32):
@@ -56,12 +64,24 @@ def _format_tail(values, width=32):
     return "".join(out)
 
 
-class PythonJitterBenchmark:
-    def __init__(self, gc_pressure="medium"):
-        """
-        gc_pressure: "none", "light", "medium", "heavy", "extreme"
-        Controls the GC churn profile of the benchmark.
-        """
+# Numba JIT-compiled sine generation
+if HAS_NUMBA:
+    @njit(fastmath=True)
+    def _numba_sine(frames, phase_inc, amplitude):
+        """Numba-compiled sine wave generation - eliminates Python dispatch overhead."""
+        t = np.arange(frames)
+        phases = phase_inc * t
+        return amplitude * np.sin(phases)
+else:
+    def _numba_sine(frames, phase_inc, amplitude):
+        """Pure Python fallback."""
+        t = np.arange(frames)
+        phases = phase_inc * t
+        return amplitude * np.sin(phases)
+
+
+class NumbaJitterBenchmark:
+    def __init__(self):
         self.phase = 0.0
         self.phase_increment = (TWO_PI * SINE_FREQ) / SAMPLE_RATE
         self.amplitude = 0.25
@@ -73,45 +93,6 @@ class PythonJitterBenchmark:
         self.first_callback = True
         self.callback_count = 0
         self.underrun_count = 0
-
-        # GC pressure configuration
-        self.gc_pressure = gc_pressure
-        self._init_gc_profile(gc_pressure)
-
-    def _init_gc_profile(self, pressure):
-        """Initialize GC profile based on pressure level."""
-        if pressure == "none":
-            # No churn baseline - minimal allocations
-            self._churn_size = 0
-            self._large_buffer_size = 0
-            self._pin_list_length = 0
-        elif pressure == "light":
-            # Light churn - small allocations
-            self._churn_size = 10
-            self._large_buffer_size = 0
-            self._pin_list_length = 5
-        elif pressure == "medium":
-            # Medium churn - moderate allocations
-            self._churn_size = 50
-            self._large_buffer_size = 0
-            self._pin_list_length = 20
-        elif pressure == "heavy":
-            # Heavy churn - larger allocations
-            self._churn_size = 200
-            self._large_buffer_size = 1024 * 1024  # 1 MiB per node
-            self._pin_list_length = 100
-        elif pressure == "extreme":
-            # Extreme churn - maximum allocations
-            self._churn_size = 500
-            self._large_buffer_size = 1024 * 1024  # 1 MiB per node
-            self._pin_list_length = 500
-
-    def _get_gc_stats_snapshot(self):
-        """Get GC stats snapshot for measuring pause time."""
-        try:
-            return gc.get_stats()
-        except (AttributeError, TypeError):
-            return None
 
     def audio_callback(self, outdata, frames, time_info, status):
         # 1. Entry Timestamp
@@ -128,16 +109,20 @@ class PythonJitterBenchmark:
             self.first_callback = False
         self.prev_entry_ns = t_entry
 
-        # 2. Phase-continuous Sine Wave DSP Generation
-        t = np.arange(frames)
-        phases = self.phase + t * self.phase_increment
-        outdata[:, 0] = self.amplitude * np.sin(phases)
-        self.phase = (self.phase + frames * self.phase_increment) % TWO_PI
+        # 2. Phase-continuous Sine Wave DSP Generation (Numba JIT or pure Python)
+        if HAS_NUMBA:
+            sine_values = _numba_sine(frames, self.phase_increment, self.amplitude)
+        else:
+            # Pure Python fallback
+            t = np.arange(frames)
+            phases = self.phase + t * self.phase_increment
+            sine_values = self.amplitude * np.sin(phases)
+            self.phase = (self.phase + frames * self.phase_increment) % TWO_PI
 
-        # 3. GC Churn Simulation
-        # - Pin a long-lived list and rotate references through it
-        # - Allocate varying-size numpy buffers to trigger major GC collections
-        self._run_gchurn(t_entry)
+        outdata[:, 0] = sine_values
+
+        # 3. Numba has minimal GC churn - optional light churn for comparison
+        # Unlike the GC-churn engine, Numba allocates outside the hot path
 
         # 4. Exit Timestamp & Metrics Calculation
         t_exit = time.perf_counter_ns()
@@ -161,61 +146,20 @@ class PythonJitterBenchmark:
         ))
         self.callback_count += 1
 
-    def _run_gchurn(self, t_entry):
-        """Run GC churn simulation based on the configured pressure level."""
-        pressure = self.gc_pressure
-
-        if pressure == "none":
-            # No intentional churn - minimal work
-            return
-
-        # Always maintain a pinned list that GC must traverse
-        if not hasattr(self, '_pinned_list'):
-            # Create a long-lived list that persists across callbacks
-            self._pinned_list = [{"idx": i, "data": None} for i in range(self._pin_list_length)]
-        
-        # Rotate references through the pinned list
-        for i in range(min(self._churn_size, len(self._pinned_list))):
-            node = self._pinned_list[i]
-            # Alternate references to create cycles
-            node["data"] = np.zeros(250, dtype=np.float32) if self._large_buffer_size == 0 else np.zeros(self._large_buffer_size // 8, dtype=np.float32)
-            # Create cyclic reference for heavier GC pressure
-            if self._large_buffer_size > 0 and i < self._pin_list_length - 1:
-                self._pinned_list[i + 1]["ref"] = node
-            elif self._large_buffer_size == 0 and i < self._pin_list_length - 1:
-                self._pinned_list[i + 1]["ref"] = node
-
-        # Last node references back to create cycle
-        if self._pin_list_length > 0:
-            self._pinned_list[-1]["ref"] = self._pinned_list[0]
-
-        # Deliberately delete some references to trigger GC
-        # But keep the pinned_list alive so GC must traverse cycles
-        if self.callback_count % 10 == 0:
-            # Periodically clear and recreate to force major collections
-            old_list = self._pinned_list
-            self._pinned_list = [{"idx": i, "data": None} for i in range(self._pin_list_length)]
-            # Copy over the ref chain
-            for i in range(self._pin_length - 1):
-                self._pinned_list[i]["ref"] = self._pinned_list[i + 1]
-            if self._pin_list_length > 0:
-                self._pinned_list[-1]["ref"] = self._pinned_list[0]
-            # Allow GC to collect the old list
-            gc.collect()
-
     def run(self):
         print("========================================================")
-        print("  Python Audio Callback Jitter & GC Benchmark (sounddevice)")
+        print("  Numba JIT Audio Callback Benchmark (sounddevice)")
         print("========================================================")
         print(f"Sample Rate:     {SAMPLE_RATE} Hz")
         print(f"Block Size:      {BLOCK_SIZE} frames")
         print(f"Deadline (Tmax): {DEADLINE_MS:.4f} ms ({DEADLINE_US:.2f} us)")
         print(f"Target Signal:   {SINE_FREQ} Hz Sine Wave")
         print(f"Duration:        {RUN_DURATION_SEC} seconds")
-        print(f"Memory Policy:   GC Churn Pressure: {self.gc_pressure}")
+        print(f"Numba JIT:       {'Enabled' if HAS_NUMBA else 'Disabled'}")
+        print("Memory Policy:   Numba JIT (minimal heap allocations in hot path)")
         print("--------------------------------------------------------")
 
-        # Enable GC explicitly and ensure tracking
+        # Enable GC explicitly
         gc.enable()
 
         try:
@@ -233,7 +177,7 @@ class PythonJitterBenchmark:
             return False
 
         print(f"[+] Stream complete. Recorded {len(self.records)} callbacks.")
-        print("[+] Exporting metrics to py_metrics.csv...")
+        print("[+] Exporting metrics to py_metrics_numba.csv...")
 
         with open(PY_METRICS_PATH, "w", newline="") as f:
             writer = csv.writer(f)
@@ -244,7 +188,7 @@ class PythonJitterBenchmark:
         mean_texec = np.mean(texec_list) if texec_list else 0.0
         max_texec = np.max(texec_list) if texec_list else 0.0
 
-        print("[+] Exported to py_metrics.csv successfully.")
+        print("[+] Exported to py_metrics_numba.csv successfully.")
         print(f"    - Mean T_exec:  {mean_texec:.2f} us")
         print(f"    - Max T_exec:   {max_texec:.2f} us")
         print(f"    - Underruns:    {self.underrun_count}")
@@ -292,19 +236,17 @@ class PythonJitterBenchmark:
         stdout.flush()
 
     @staticmethod
-    def list_gc_profiles():
-        """List available GC pressure profiles."""
-        return ["none", "light", "medium", "heavy", "extreme"]
+    def is_numba_available():
+        return HAS_NUMBA
 
 
 if __name__ == "__main__":
-    # Allow specifying GC pressure from command line
     import argparse
-    parser = argparse.ArgumentParser(description="Python GC Jitter Benchmark")
-    parser.add_argument("--gc-pressure", choices=PythonJitterBenchmark.list_gc_profiles(),
-                        default="medium", help="GC pressure profile (default: medium)")
+    parser = argparse.ArgumentParser(description="Numba JIT Audio Benchmark")
+    parser.add_argument("-- benchmark", action="store_true",
+                        help="Run Numba benchmar")
     args = parser.parse_args()
 
-    benchmark = PythonJitterBenchmark(gc_pressure=args.gc_pressure)
+    benchmark = NumbaJitterBenchmark()
     success = benchmark.run()
     sys.exit(0 if success else 1)

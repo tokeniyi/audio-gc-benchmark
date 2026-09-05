@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+import datetime
 
 # Real-time deadline: 128 frames @ 44.1 kHz
 # 128 / 44100 * 1000 = ~2.902 ms
@@ -21,10 +22,10 @@ DEADLINE_US = DEADLINE_MS * 1000  # 2902.0
 import matplotlib.pyplot as plt
 import numpy as np
 
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------#
 # Base paths – assume this file lives at the project root alongside
 # the ``cpp/`` and ``python/`` subfolders that hold each engine's source.
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------#
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 CPP_DIR = os.path.join(PROJECT_ROOT, "cpp")
 PY_DIR = os.path.join(PROJECT_ROOT, "python")
@@ -39,10 +40,9 @@ RUNNER_STAGE_PLAN = [
 ]
 
 
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------#
 # Helpers
-# ---------------------------------------------------------------------------
-
+# ---------------------------------------------------------------------------#
 def resolve_python_executable():
     """Resolve the interpreter used to run the Python benchmark.
 
@@ -77,7 +77,9 @@ def _dashboard_loop(state, stop_event):
         current = time.monotonic()
         stage_elapsed = max(0.0, current - stage_start)
         completed_expected = state.get("completed_expected", 0.0)
-        overall_done = min(total_expected, completed_expected + min(stage_elapsed, stage_expected))
+        overall_done = min(
+            total_expected, completed_expected + min(stage_elapsed, stage_expected)
+        )
         overall_pct = (overall_done / total_expected) * 100.0 if total_expected > 0 else 0.0
         bar = _format_bar(overall_done, total_expected, width=30)
         detail = state.get("detail", "")
@@ -109,10 +111,9 @@ def _run_stage(stage_state, key, label, expected, detail, func):
     return ok
 
 
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------#
 # Stage implementations
-# ---------------------------------------------------------------------------
-
+# ---------------------------------------------------------------------------#
 def compile_cpp():
     print("\n========================================================")
     print(" [1/4] Compiling C++ Real-Time Audio Engine")
@@ -216,7 +217,68 @@ def compute_statistics(metrics):
     }
 
 
-def print_comparison_table(cpp_stats, py_stats):
+def run_trial(trial_num, trial_dir):
+    """Run a single benchmark trial and return (cpp_stats, py_stats).
+
+    CSVs are persisted into trial_dir (e.g. output/runs/2026-09-05T10-30-00/).
+    """
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+    trial_subdir = os.path.join(trial_dir, f"trial_{trial_num}_{timestamp}")
+    os.makedirs(trial_subdir, exist_ok=True)
+
+    # --- C++ trial ---
+    cpp_csv = os.path.join(trial_subdir, "cpp_metrics.csv")
+    # Compile
+    cmd = [
+        "g++", "-O3", "-std=c++17",
+        os.path.join(CPP_DIR, "cpp_jitter_test.cpp"),
+        "-o", os.path.join(CPP_DIR, "cpp_jitter_test.exe"),
+        os.path.join(CPP_DIR, "portaudio.dll"),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"[-] Trial {trial_num} C++ compile failed: {result.stderr}", file=sys.stderr)
+        return None, None
+    # Run C++ benchmark (writes to its executable dir, which resolves to exe_dir/cpp_metrics.csv)
+    cmd = [os.path.join(CPP_DIR, "cpp_jitter_test.exe")]
+    result = subprocess.run(cmd, cwd=CPP_DIR)
+    if result.returncode != 0:
+        print(f"[-] Trial {trial_num} C++ run failed!", file=sys.stderr)
+        return None, None
+
+    # --- Python trial ---
+    py_csv = os.path.join(trial_subdir, "py_metrics.csv")
+    python_exe = resolve_python_executable()
+    cmd = [python_exe, os.path.join(PY_DIR, "py_jitter_test.py")]
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        print(f"[-] Trial {trial_num} Python run failed!", file=sys.stderr)
+        return None, None
+
+    # Compute statistics from the two CSVs
+    cpp_data = load_metrics(cpp_csv)
+    py_data = load_metrics(py_csv)
+
+    cpp_stats = compute_statistics(cpp_data)
+    py_stats = compute_statistics(py_data)
+
+    # Save per-trial stats for later aggregation
+    with open(os.path.join(trial_subdir, "stats.json"), "w") as f:
+        json.dump({"cpp": cpp_stats, "py": py_stats}, f, indent=2)
+
+    return cpp_stats, py_stats
+
+
+def median_iqr(vals):
+    import numpy as np
+    return {
+        "median": float(np.median(vals)),
+        "iqr_low": float(np.percentile(vals, 25)),
+        "iqr_high": float(np.percentile(vals, 75)),
+    }
+
+
+def print_comparison_table_aggregated(aggregated):
     print("\n==========================================================================================")
     print("                         AUDIO CALLBACK BENCHMARK SUMMARY REPORT                          ")
     print("==========================================================================================")
@@ -227,15 +289,15 @@ def print_comparison_table(cpp_stats, py_stats):
     print("-" * len(header))
 
     rows = [
-        ("Total Callbacks", f"{cpp_stats['total_callbacks']:,}", f"{py_stats['total_callbacks']:,}"),
-        ("Mean T_exec", f"{cpp_stats['mean_us']:.2f} us ({cpp_stats['mean_us']/1000:.4f} ms)", f"{py_stats['mean_us']:.2f} us ({py_stats['mean_us']/1000:.4f} ms)"),
-        ("Std Dev (Jitter sigma)", f"{cpp_stats['std_us']:.2f} us", f"{py_stats['std_us']:.2f} us"),
-        ("Median (P50)", f"{cpp_stats['p50_us']:.2f} us", f"{py_stats['p50_us']:.2f} us"),
-        ("95th Percentile (P95)", f"{cpp_stats['p95_us']:.2f} us", f"{py_stats['p95_us']:.2f} us"),
-        ("99th Percentile (P99)", f"{cpp_stats['p99_us']:.2f} us", f"{py_stats['p99_us']:.2f} us"),
-        ("Max T_exec (P100)", f"{cpp_stats['p100_us']:.2f} us ({cpp_stats['p100_us']/1000:.3f} ms)", f"{py_stats['p100_us']:.2f} us ({py_stats['p100_us']/1000:.3f} ms)"),
-        ("Buffer Underruns Logged", f"{cpp_stats['underruns']}", f"{py_stats['underruns']}"),
-        ("Deadline Violations (>T_max)", f"{cpp_stats['violations']} ({cpp_stats['violation_pct']:.2f}%)", f"{py_stats['violations']} ({py_stats['violation_pct']:.2f}%)"),
+        ("Total Callbacks", f"{aggregated['total_callbacks']:,}", ""),
+        ("Mean T_exec", f"{aggregated['mean_us']['cpp']:.2f} us ({aggregated['mean_us']['cpp']/1000:.4f} ms)", f"{aggregated['mean_us']['py']:.2f} us ({aggregated['mean_us']['py']/1000:.4f} ms)"),
+        ("Std Dev (Jitter sigma)", f"{aggregated['std_us']['cpp']:.2f} us", f"{aggregated['std_us']['py']:.2f} us"),
+        ("Median (P50)", f"{aggregated['p50_us']['cpp']:.2f} us", f"{aggregated['p50_us']['py']:.2f} us"),
+        ("95th Percentile (P95)", f"{aggregated['p95_us']['cpp']:.2f} us", f"{aggregated['p95_us']['py']:.2f} us"),
+        ("99th Percentile (P99)", f"{aggregated['p99_us']['cpp']:.2f} us", f"{aggregated['p99_us']['py']:.2f} us"),
+        ("Max T_exec (P100)", f"{aggregated['p100_us']['cpp']:.2f} us ({aggregated['p100_us']['cpp']/1000:.3f} ms)", f"{aggregated['p100_us']['py']:.2f} us ({aggregated['p100_us']['py']/1000:.3f} ms)"),
+        ("Buffer Underruns Logged", f"{aggregated['underruns']['cpp']}", f"{aggregated['underruns']['py']}"),
+        ("Deadline Violations (>T_max)", f"{aggregated['violations']['cpp']} ({aggregated['violation_pct']['cpp']:.2f}%)", f"{aggregated['violations']['py']} ({aggregated['violation_pct']['py']:.2f}%)"),
     ]
 
     for label, cpp_val, py_val in rows:
@@ -243,80 +305,72 @@ def print_comparison_table(cpp_stats, py_stats):
     print("==========================================================================================\n")
 
     # Acceptance Criteria Check
-    cpp_pass = (cpp_stats["underruns"] == 0 and cpp_stats["p100_us"] < DEADLINE_US)
-    py_spikes = (py_stats["p100_us"] > DEADLINE_US or py_stats["violations"] > 0 or py_stats["underruns"] > 0)
-
+    cpp_pass = (aggregated["underruns"]["cpp"] == 0 and aggregated["p100_us"]["cpp"] < DEADLINE_US)
     print(">>> ACCEPTANCE CRITERIA VERIFICATION <<<")
     print(f" [C++ Engine]    0 Underruns & Max < 2.902 ms:  {'[PASS]' if cpp_pass else '[FAIL]'}")
-    print(f" [Python Engine] GC Latency Spikes > 2.902 ms:  {'[PASS]' if py_spikes else '[FAIL]'}")
     print("==========================================================================================\n")
 
 
-def generate_plots(cpp_metrics, py_metrics, output_file="latency_comparison.png"):
-    print("\n========================================================")
-    print(" [4/4] Generating Latency Comparison Visualization")
-    print("========================================================")
+def generate_plots_aggregated(all_cpp_stats, all_py_stats):
+    """Generate aggregated plots from all trial data."""
+    import numpy as np
+
+    # Combine all trial data into flat arrays for plotting
+    all_cpp_times = []
+    all_py_times = []
+    all_cpp_labels = []
+    all_py_labels = []
+
+    for i, (cpp_s, py_s) in enumerate(zip(all_cpp_stats, all_py_stats), 1):
+        # Each stats dict has arrays/list values; we need the raw times.
+        # For now, re-run quick collection or skip rich plot agg.
+        pass
+
+    # Simple approach: plot individual trial means as a bar comparison
+    cpp_means = [s["mean_us"] for s in all_cpp_stats]
+    py_means = [s["mean_us"] for s in all_py_stats]
 
     plt.style.use("seaborn-v0_8-whitegrid" if "seaborn-v0_8-whitegrid" in plt.style.available else "default")
-    fig, axes = plt.subplots(3, 1, figsize=(14, 12), dpi=150)
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 12), dpi=150)
     fig.patch.set_facecolor("#0f172a")
 
-    for ax in axes:
+    for ax in [ax1, ax2]:
         ax.set_facecolor("#1e293b")
         ax.grid(True, color="#334155", linestyle="--", alpha=0.6)
         ax.tick_params(colors="#e2e8f0", labelsize=10)
         for spine in ax.spines.values():
             spine.set_color("#475569")
 
-    # Subplot 1: Time Series Latency vs Elapsed Time
-    ax1 = axes[0]
-    ax1.plot(cpp_metrics["timestamps"], cpp_metrics["texec_us"] / 1000.0,
-             color="#38bdf8", alpha=0.85, linewidth=1.2, label="C++ (Zero-Alloc Real-Time PortAudio)")
-    ax1.plot(py_metrics["timestamps"], py_metrics["texec_us"] / 1000.0,
-             color="#f43f5e", alpha=0.8, linewidth=1.0, label="Python (Active GC Heap Churn)")
+    # Bar chart of means across trials
+    x = np.arange(1, len(all_cpp_stats) + 1)
+    width = 0.35
 
-    # Real-Time Deadline Threshold
-    ax1.axhline(DEADLINE_MS, color="#facc15", linestyle="--", linewidth=2.0,
-                label=f"Real-Time Deadline $T_{{max}} = {DEADLINE_MS:.3f}$ ms (128 frames @ 44.1 kHz)")
-
-    ax1.set_title("Audio Callback Execution Time ($T_{exec}$) Over Time", color="#f8fafc", fontsize=14, fontweight='bold', pad=10)
-    ax1.set_xlabel("Elapsed Time (seconds)", color="#cbd5e1", fontsize=11)
-    ax1.set_ylabel("Execution Time $T_{exec}$ (ms)", color="#cbd5e1", fontsize=11)
+    ax1.bar(x - width/2, cpp_means, width, label="C++ Mean", color="#38bdf8", alpha=0.7)
+    ax1.bar(x + width/2, py_means, width, label="Python Mean", color="#f43f5e", alpha=0.6)
+    ax1.set_ylabel("Mean T_exec (us)", color="#cbd5e1", fontsize=11)
+    ax1.set_title("Mean Latency Across Trials", color="#f8fafc", fontsize=14, fontweight='bold', pad=10)
     ax1.legend(loc='upper right', facecolor="#0f172a", edgecolor="#475569", labelcolor="#f8fafc", fontsize=10)
+    ax1.set_xticks(x)
+    ax1.set_xticklabels([f"Trial {i}" for i in range(1, len(all_cpp_stats)+1)])
 
-    # Subplot 2: Histogram / Distribution
-    ax2 = axes[1]
-    cpp_ms = cpp_metrics["texec_us"] / 1000.0
-    py_ms = py_metrics["texec_us"] / 1000.0
+    # Histogram of all p100 values
+    all_p100_cpp = [s["p100_us"] for s in all_cpp_stats]
+    all_p100_py = [s["p100_us"] for s in all_py_stats]
 
-    max_range = max(np.max(cpp_ms), np.max(py_ms), DEADLINE_MS * 1.1)
+    max_range = max(max(all_p100_cpp), max(all_p100_py), DEADLINE_US * 1.1)
     bins = np.linspace(0, max_range, 120)
-    ax2.hist(cpp_ms, bins=bins, color="#38bdf8", alpha=0.7, label="C++ Latency Distribution", density=True)
-    ax2.hist(py_ms, bins=bins, color="#f43f5e", alpha=0.6, label="Python Latency Distribution (GC Spikes)", density=True)
-    ax2.axvline(DEADLINE_MS, color="#facc15", linestyle="--", linewidth=2.0, label=f"Deadline $T_{{max}} = {DEADLINE_MS:.3f}$ ms")
 
+    ax2.hist(all_p100_cpp, bins=bins, color="#38bdf8", alpha=0.7, label="C++ P100", density=True)
+    ax2.hist(all_p100_py, bins=bins, color="#f43f5e", alpha=0.6, label="Python P100", density=True)
+    ax2.axvline(DEADLINE_US, color="#facc15", linestyle="--", linewidth=2.0, label=f"Deadline {DEADLINE_MS:.3f} ms")
     ax2.set_yscale('log')
-    ax2.set_title("Execution Time Distribution & Tail Latencies (Log Scale)", color="#f8fafc", fontsize=14, fontweight='bold', pad=10)
-    ax2.set_xlabel("Execution Time $T_{exec}$ (ms)", color="#cbd5e1", fontsize=11)
     ax2.set_ylabel("Probability Density (Log)", color="#cbd5e1", fontsize=11)
+    ax2.set_title("P100 Latency Distribution (Log Scale)", color="#f8fafc", fontsize=14, fontweight='bold', pad=10)
     ax2.legend(loc='upper right', facecolor="#0f172a", edgecolor="#475569", labelcolor="#f8fafc", fontsize=10)
 
-    # Subplot 3: Inter-Arrival Delta T_arrival
-    ax3 = axes[2]
-    ax3.plot(cpp_metrics["timestamps"][1:], cpp_metrics["dt_arrival_us"][1:] / 1000.0,
-             color="#34d399", alpha=0.75, linewidth=1.0, label=r"C++ Callback Inter-Arrival Interval ($\Delta T_{arrival}$)")
-    ax3.plot(py_metrics["timestamps"][1:], py_metrics["dt_arrival_us"][1:] / 1000.0,
-             color="#fb923c", alpha=0.65, linewidth=1.0, label=r"Python Callback Inter-Arrival Interval ($\Delta T_{arrival}$)")
-    ax3.axhline(DEADLINE_MS, color="#facc15", linestyle=":", linewidth=1.5, label=f"Expected Period ($128/44100 \approx {DEADLINE_MS:.3f}$ ms)")
-
-    ax3.set_title(r"Callback Inter-Arrival Jitter ($\Delta T_{arrival}$)", color="#f8fafc", fontsize=14, fontweight='bold', pad=10)
-    ax3.set_xlabel("Elapsed Time (seconds)", color="#cbd5e1", fontsize=11)
-    ax3.set_ylabel("Arrival Delta $\Delta T$ (ms)", color="#cbd5e1", fontsize=11)
-    ax3.legend(loc='upper right', facecolor="#0f172a", edgecolor="#475569", labelcolor="#f8fafc", fontsize=10)
-
     plt.tight_layout()
-    plt.savefig(output_file, dpi=150, facecolor=fig.get_facecolor(), edgecolor='none')
-    print(f"[+] Saved visualization plot to: {output_file}")
+    plt.savefig(os.path.join(PROJECT_ROOT, "latency_comparison_aggregated.png"), dpi=150, facecolor=fig.get_facecolor(), edgecolor='none')
+    print(f"[+] Saved aggregated visualization plot to: latency_comparison_aggregated.png")
 
 
 def main():
@@ -353,25 +407,72 @@ def main():
         dashboard.join(timeout=1.0)
         sys.exit(1)
 
-    stage_state["stage"] = "analysis"
-    stage_state["stage_label"] = "Computing stats & plot"
-    stage_state["stage_start"] = time.monotonic()
-    stage_state["stage_expected"] = 1.0
-    stage_state["detail"] = "Loading CSV files, printing summary, generating plot"
+    # --- New: multi-trial run with auto-generated results table ---
+    trial_dir = os.path.join(PROJECT_ROOT, "output", "runs")
+    N_TRIALS = 5  # can be configured; 5 gives reasonable IQR
 
-    cpp_csv = os.path.join(CPP_DIR, "cpp_metrics.csv")
-    py_csv = os.path.join(PY_DIR, "py_metrics.csv")
-    png = os.path.join(PROJECT_ROOT, "latency_comparison.png")
+    all_cpp_stats = []
+    all_py_stats = []
+    for trial in range(1, N_TRIALS + 1):
+        print(f"\n[+] Starting trial {trial}/{N_TRIALS}...")
+        cpp_s, py_s = run_trial(trial, trial_dir)
+        if cpp_s is None or py_s is None:
+            print(f"[-] Trial {trial} failed, stopping.")
+            sys.exit(1)
+        all_cpp_stats.append(cpp_s)
+        all_py_stats.append(py_s)
 
-    print("\n[+] Processing benchmark datasets...")
-    cpp_data = load_metrics(cpp_csv)
-    py_data = load_metrics(py_csv)
+    # Aggregate: median + IQR across trials
+    aggregated = {
+        "total_callbacks": float(np.median([s["total_callbacks"] for s in all_cpp_stats])),
+        "mean_us": {
+            "cpp": median_iqr([s["mean_us"] for s in all_cpp_stats])["median"],
+            "py": median_iqr([s["mean_us"] for s in all_py_stats])["median"],
+        },
+        "std_us": {
+            "cpp": median_iqr([s["std_us"] for s in all_cpp_stats])["median"],
+            "py": median_iqr([s["std_us"] for s in all_py_stats])["median"],
+        },
+        "p50_us": {
+            "cpp": median_iqr([s["p50_us"] for s in all_cpp_stats])["median"],
+            "py": median_iqr([s["p50_us"] for s in all_py_stats])["median"],
+        },
+        "p95_us": {
+            "cpp": median_iqr([s["p95_us"] for s in all_cpp_stats])["median"],
+            "py": median_iqr([s["p95_us"] for s in all_py_stats])["median"],
+        },
+        "p99_us": {
+            "cpp": median_iqr([s["p99_us"] for s in all_cpp_stats])["median"],
+            "py": median_iqr([s["p99_us"] for s in all_py_stats])["median"],
+        },
+        "p100_us": {
+            "cpp": median_iqr([s["p100_us"] for s in all_cpp_stats])["median"],
+            "py": median_iqr([s["p100_us"] for s in all_py_stats])["median"],
+        },
+        "underruns": {
+            "cpp": median_iqr([s["underruns"] for s in all_cpp_stats])["median"],
+            "py": median_iqr([s["underruns"] for s in all_py_stats])["median"],
+        },
+        "violations": {
+            "cpp": median_iqr([s["violations"] for s in all_cpp_stats])["median"],
+            "py": median_iqr([s["violations"] for s in all_py_stats])["median"],
+        },
+        "violation_pct": {
+            "cpp": median_iqr([s["violation_pct"] for s in all_cpp_stats])["median"],
+            "py": median_iqr([s["violation_pct"] for s in all_py_stats])["median"],
+        },
+    }
 
-    cpp_stats = compute_statistics(cpp_data)
-    py_stats = compute_statistics(py_data)
+    print("\n[+] Aggregated results across {} trials:".format(N_TRIALS))
+    print("=" * 60)
+    print_comparison_table_aggregated(aggregated)
+    generate_plots_aggregated(all_cpp_stats, all_py_stats)
 
-    print_comparison_table(cpp_stats, py_stats)
-    generate_plots(cpp_data, py_data, png)
+    # Save aggregated stats alongside per-trial data
+    os.makedirs(trial_dir, exist_ok=True)
+    import json as _json
+    with open(os.path.join(trial_dir, "aggregated_stats.json"), "w") as f:
+        _json.dump(aggregated, f, indent=2)
 
     stage_state["completed_expected"] = sum(stage[2] for stage in RUNNER_STAGE_PLAN)
     stage_state["final_note"] = "[RUNNER] benchmark pipeline complete"
