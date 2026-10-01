@@ -167,7 +167,8 @@ static void render_live_dashboard(double duration_sec) {
             continue;
         }
         next_tick = now + refresh;
-        std::cout << "[2K" << build_live_dashboard_line() << std::flush;
+        std::cout << "
+[2K" << build_live_dashboard_line() << std::flush;
     }
     std::cout << std::endl;
 }
@@ -328,8 +329,14 @@ int main() {
     std::cout << "[+] Stream complete. Recorded " << metric_count << " callbacks." << std::endl;
     std::cout << "[+] Exporting metrics to cpp_metrics.csv..." << std::endl;
 
-    // Export metrics to CSV, writing to current working directory
-    std::string csv_path = "cpp_metrics.csv";
+    // Export metrics to CSV, writing to the executable's directory
+    // Resolve path relative to the source file location, not CWD
+    std::string exe_dir = ".";
+    size_t last_sep = std::string(__FILE__).find_last_of("/\\");
+    if (last_sep != std::string::npos) {
+        exe_dir = std::string(__FILE__).substr(0, last_sep);
+    }
+    std::string csv_path = exe_dir + "/cpp_metrics.csv";
     std::ofstream csv(csv_path);
     if (!csv.is_open()) {
         std::cerr << "[-] Error opening cpp_metrics.csv for writing!" << std::endl;

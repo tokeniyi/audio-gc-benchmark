@@ -35,7 +35,7 @@ def _format_bar(value, maximum, width=24, fill="#", empty="-"):
     ratio = max(0.0, min(1.0, value / maximum))
     filled = int(round(ratio * width))
     filled = max(0, min(width, filled))
-    return fill * filled + empty * (width - formatted)
+    return fill * filled + empty * (width - filled)
 
 
 def _format_tail(values, width=32):
@@ -105,6 +105,11 @@ class PythonJitterBenchmark:
             self._churn_size = 500
             self._large_buffer_size = 1024 * 1024  # 1 MiB per node
             self._pin_list_length = 500
+        else:
+            valid = ["none", "light", "medium", "heavy", "extreme"]
+            raise ValueError(
+                f"Invalid gc_pressure '{pressure}'. Must be one of: {valid}"
+            )
 
     def _get_gc_stats_snapshot(self):
         """Get GC stats snapshot for measuring pause time."""
@@ -196,7 +201,7 @@ class PythonJitterBenchmark:
             old_list = self._pinned_list
             self._pinned_list = [{"idx": i, "data": None} for i in range(self._pin_list_length)]
             # Copy over the ref chain
-            for i in range(self._pin_length - 1):
+            for i in range(self._pin_list_length - 1):
                 self._pinned_list[i]["ref"] = self._pinned_list[i + 1]
             if self._pin_list_length > 0:
                 self._pinned_list[-1]["ref"] = self._pinned_list[0]

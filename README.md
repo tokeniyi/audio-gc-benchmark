@@ -97,11 +97,33 @@ Inside each callback invocation:
 python -m venv .venv
 
 # Install dependencies into the project-local venv
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install numpy sounddevice matplotlib pandas
+.venv\Scripts\python.exe -m pip install --upgrade pip
+.venv\Scripts\python.exe -m pip install numpy sounddevice matplotlib pandas
 
 # Run the master orchestrator using the local venv
-.\.venv\Scripts\python.exe run_benchmark.py
+.venv\Scripts\python.exe run_benchmark.py
+```
+
+#### CLI Options
+
+`run_benchmark.py` accepts the following command-line flags:
+
+| Flag | Values | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--gc-pressure` | `none`, `light`, `medium`, `heavy`, `extreme` | `medium` | Sets the Python engine's GC churn profile. `none` disables churn for a no-GC baseline; `heavy`/`extreme` use 1 MiB buffer allocations to trigger major collections. |
+| `--trials` | Integer | `5` | Number of benchmark trials to run. Each trial runs both C++ and Python engines independently. Results are aggregated with median + IQR. |
+| `--help` | — | — | Show help message and exit. |
+
+**Examples:**
+```bash
+# Run with heavy GC pressure to stress-test the Python engine
+.venv\Scripts\python.exe run_benchmark.py --gc-pressure heavy
+
+# Run 10 trials for more robust statistics
+.venv\Scripts\python.exe run_benchmark.py --trials 10
+
+# Run no-churn baseline (Python engine with zero GC pressure)
+.venv\Scripts\python.exe run_benchmark.py --gc-pressure none
 ```
 
 `run_benchmark.py` now always uses `.venv\Scripts\python.exe` for the Python benchmark run.

@@ -7,12 +7,14 @@ computes statistical metrics, and generates side-by-side latency visualizations.
 """
 
 import csv
+import json
 import os
 import subprocess
 import sys
 import threading
 import time
 import datetime
+import argparse
 
 # Real-time deadline: 128 frames @ 44.1 kHz
 # 128 / 44100 * 1000 = ~2.902 ms
@@ -148,14 +150,17 @@ def run_cpp_benchmark():
     return True
 
 
-def run_py_benchmark():
+def run_py_benchmark(gc_pressure="medium"):
     print("\n========================================================")
     print(" [3/4] Executing Python Engine (Active Heap Churn / GC)")
     print("========================================================")
     python_exe = resolve_python_executable()
     print(f"Using project-local .venv interpreter: {python_exe}")
+    print(f"GC Pressure Profile: {gc_pressure}")
 
     cmd = [python_exe, os.path.join(PY_DIR, "py_jitter_test.py")]
+    if gc_pressure != "medium":
+        cmd.extend(["--gc-pressure", gc_pressure])
     result = subprocess.run(cmd)
     if result.returncode != 0:
         print("[-] Python benchmark execution failed!", file=sys.stderr)
@@ -217,7 +222,7 @@ def compute_statistics(metrics):
     }
 
 
-def run_trial(trial_num, trial_dir):
+def run_trial(trial_num, trial_dir, gc_pressure="medium"):
     """Run a single benchmark trial and return (cpp_stats, py_stats).
 
     CSVs are persisted into trial_dir (e.g. output/runs/2026-09-05T10-30-00/).
@@ -250,6 +255,8 @@ def run_trial(trial_num, trial_dir):
     py_csv = os.path.join(trial_subdir, "py_metrics.csv")
     python_exe = resolve_python_executable()
     cmd = [python_exe, os.path.join(PY_DIR, "py_jitter_test.py")]
+    if gc_pressure != "medium":
+        cmd.extend(["--gc-pressure", gc_pressure])
     result = subprocess.run(cmd)
     if result.returncode != 0:
         print(f"[-] Trial {trial_num} Python run failed!", file=sys.stderr)
@@ -374,6 +381,23 @@ def generate_plots_aggregated(all_cpp_stats, all_py_stats):
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Cross-Language Real-Time Audio Callback Benchmark Suite"
+    )
+    parser.add_argument(
+        "--gc-pressure",
+        choices=["none", "light", "medium", "heavy", "extreme"],
+        default="medium",
+        help="Python GC pressure profile (default: medium)",
+    )
+    parser.add_argument(
+        "--trials",
+        type=int,
+        default=5,
+        help="Number of benchmark trials to run (default: 5)",
+    )
+    args = parser.parse_args()
+
     stage_state = {
         "stage": "idle",
         "stage_label": "Starting",
@@ -401,7 +425,7 @@ def main():
         sys.exit(1)
 
     if not _run_stage(stage_state, "python", "Running Python benchmark", 10.0,
-                      "Executing py_jitter_test.py", run_py_benchmark):
+                      "Executing py_jitter_test.py", lambda: run_py_benchmark(args.gc_pressure)):
         stop_event.set()
         stage_state["final_note"] = "[RUNNER] benchmark pipeline aborted during Python run"
         dashboard.join(timeout=1.0)
@@ -409,13 +433,13 @@ def main():
 
     # --- New: multi-trial run with auto-generated results table ---
     trial_dir = os.path.join(PROJECT_ROOT, "output", "runs")
-    N_TRIALS = 5  # can be configured; 5 gives reasonable IQR
+    N_TRIALS = args.trials  # can be configured via CLI; 5 gives reasonable IQR
 
     all_cpp_stats = []
     all_py_stats = []
     for trial in range(1, N_TRIALS + 1):
         print(f"\n[+] Starting trial {trial}/{N_TRIALS}...")
-        cpp_s, py_s = run_trial(trial, trial_dir)
+        cpp_s, py_s = run_trial(trial, trial_dir, gc_pressure=args.gc_pressure)
         if cpp_s is None or py_s is None:
             print(f"[-] Trial {trial} failed, stopping.")
             sys.exit(1)
@@ -470,9 +494,8 @@ def main():
 
     # Save aggregated stats alongside per-trial data
     os.makedirs(trial_dir, exist_ok=True)
-    import json as _json
     with open(os.path.join(trial_dir, "aggregated_stats.json"), "w") as f:
-        _json.dump(aggregated, f, indent=2)
+        json.dump(aggregated, f, indent=2)
 
     stage_state["completed_expected"] = sum(stage[2] for stage in RUNNER_STAGE_PLAN)
     stage_state["final_note"] = "[RUNNER] benchmark pipeline complete"

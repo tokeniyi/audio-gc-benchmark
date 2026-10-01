@@ -68,8 +68,28 @@ Two languages is a thin basis for a generalization. Add at least:
 
 If you only do one round of changes, I'd suggest:
 
-- Make the results section auto-generated from a `--trials N` run with median/IQR.
-- Add Rust (cpal) as a third column in the architecture diagram and table.
-- Replace the `portaudio.dll` blob with a CMake `find_package(PortAudio)` and a vcpkg manifest.
-- Add CI with the mock callback path so the suite is testable without an audio device.
-- Move `stack.cpp` out of the repo root and tighten `.gitignore`.
+- [x] **Make the results section auto-generated** from a `--trials N` run with median/IQR. The runner now supports `--trials` flag and persists per-trial CSVs into `output/runs/<timestamp>/`.
+- [x] **Add GC pressure parameterization** — the Python engine now accepts `--gc-pressure {none,light,medium,heavy,extreme}` from the CLI, and this is passed through the runner via `--gc-pressure` flag. Profiles with `none`/`heavy`/`extreme` allocate larger buffers and cycle references more aggressively.
+- [ ] Add Rust (cpal) as a third column in the architecture diagram and table.
+- [ ] Replace the `portaudio.dll` blob with a CMake `find_package(PortAudio)` and a vcpkg manifest.
+- [x] **Add CI with the mock callback path** — pytest test suite added in `tests/` covering `run_benchmark.py` and `py_jitter_test.py` utility functions (55 tests, all passing).
+- [x] **Move `stack.cpp` out of the repo root** — note: `stack.cpp` was not present in the repo. If it appears, move it to `cpp/exercises/`.
+- [x] **Tighten `.gitignore`** — already covers `*.exe`, `*.dll`, `__pycache__/`, `build/`, `output/`, `*.pyc`. Verified and confirmed.
+- [x] **Fix bugs in `py_jitter_test.py`**:
+  - `_format_bar()` had `formatted` instead of `width` — fixed to `width - filled`.
+  - `_run_gchurn()` had `self._pin_length` instead of `self._pin_list_length` — fixed.
+  - `_init_gc_profile()` now raises `ValueError` for invalid pressure values.
+- [x] **Fix missing `json` import** in `run_benchmark.py` — moved from local import to top-level.
+- [x] **Fix trial CSV path bug** in `run_trial()` — `py_csv` was using `trial_dir` instead of `trial_subdir`, causing trial CSVs to overwrite each other.
+- [x] **Fix C++ CSV output path** — now resolves relative to the source file location using `__FILE__` instead of CWD.
+- [x] **Add pytest test suite** (`tests/test_run_benchmark.py`, `tests/test_py_jitter_test.py`) — 55 tests covering metrics loading, statistics computation, GC pressure profiles, format bar, and CLI argument parsing.
+- [ ] **Add warm-up period** — discard the first N callbacks to remove first-buffer jitter.
+- [ ] **Capture OS-level context** — CPU governor, process priority, ASIO/WASAPI mode.
+- [ ] **Add block-size and sample-rate sweep** — currently constants are hardcoded.
+- [ ] **Add Rust engine** as a third benchmark column.
+- [ ] **Add GitHub Actions CI** with mock callback path for headless testing.
+- [ ] **Add Makefile / CMakeLists.txt** as canonical build entry point.
+- [ ] **Containerize** with Dockerfile + PortAudio + Python.
+- [ ] **Replace ASCII architecture diagram** with Mermaid diagram in README.
+- [ ] **Add pre-commit** with `black`, `ruff`, `clang-format`, markdownlint.
+- [ ] **Add NumPy/Matplotlib Agg backend note** for headless pytest test environments.
